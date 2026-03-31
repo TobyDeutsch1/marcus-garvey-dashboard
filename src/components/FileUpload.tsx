@@ -9,8 +9,6 @@ import { parseLedgerPDF } from "@/lib/parsers/ledger-parser";
 import { parseRoster } from "@/lib/parsers/roster-parser";
 import { mergeTenantData } from "@/lib/parsers/merge";
 import { useDashboardStore } from "@/lib/store";
-import { Tenant } from "@/lib/types";
-
 export function FileUpload() {
   const { setTenants, setIsLoading } = useDashboardStore();
   const [arFile, setArFile] = useState<File | null>(null);
@@ -34,29 +32,8 @@ export function FileUpload() {
         : new Map();
       const rosterData = rosterFile ? await parseRoster(rosterFile) : [];
 
-      // If we only have roster, create skeleton tenants
-      let baseData: Partial<Tenant>[] = arData;
-      if (baseData.length === 0 && rosterData.length > 0) {
-        baseData = rosterData.map((r, i) => ({
-          id: `roster-${i}`,
-          unit: r.unit,
-          firstName: r.applicant.split(/[,\s]+/).slice(1).join(" ") || r.applicant,
-          lastName: r.applicant.split(/[,\s]+/)[0] || "",
-          rent: r.rent,
-          balance: 0,
-          current: 0,
-          days30: 0,
-          days60: 0,
-          days90: 0,
-          over90: 0,
-          transactions: [],
-          flaggedForLegal: false,
-          paymentPlan: false,
-          riskTier: "current" as const,
-        }));
-      }
-
-      const tenants = mergeTenantData(baseData, ledgerData, rosterData);
+      // merge handles all combinations: AR-only, ledger-only, roster-only, or any mix
+      const tenants = mergeTenantData(arData, ledgerData, rosterData);
       setTenants(tenants);
       setStatus(`Loaded ${tenants.length} tenants successfully.`);
     } catch (err) {
