@@ -16,10 +16,12 @@ interface LedgerData {
 
 export async function parseLedgerPDF(file: File): Promise<Map<string, LedgerData>> {
   const pdfjsLib = await import("pdfjs-dist");
-  pdfjsLib.GlobalWorkerOptions.workerSrc = `//cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsLib.version}/pdf.worker.min.mjs`;
+
+  // Use the worker file copied to public/ for reliable loading
+  pdfjsLib.GlobalWorkerOptions.workerSrc = "/pdf.worker.min.mjs";
 
   const arrayBuffer = await file.arrayBuffer();
-  const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+  const pdf = await pdfjsLib.getDocument({ data: new Uint8Array(arrayBuffer) }).promise;
   const tenantMap = new Map<string, LedgerData>();
 
   for (let i = 1; i <= pdf.numPages; i++) {
