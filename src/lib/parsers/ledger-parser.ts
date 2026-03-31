@@ -4,6 +4,8 @@ interface LedgerData {
   unit: string;
   name: string;
   rent: number;
+  phone: string;
+  residentCode: string;
   transactions: Transaction[];
   aging: {
     current: number;
@@ -16,15 +18,20 @@ interface LedgerData {
 }
 
 function toNum(s: string): number {
-  const n = parseFloat(s.replace(/[$,\s()]/g, "").trim());
-  return isNaN(n) ? 0 : Math.abs(n);
+  const cleaned = s.replace(/[$,\s()]/g, "").trim();
+  if (!cleaned || cleaned === "-") return 0;
+  const n = parseFloat(cleaned);
+  return isNaN(n) ? 0 : n;
+}
+
+function toAbsNum(s: string): number {
+  return Math.abs(toNum(s));
 }
 
 /** Group PDF text items into lines sorted top-to-bottom, left-to-right */
 function itemsToLines(items: Array<{ str: string; transform: number[] }>): string[] {
   if (!items.length) return [];
 
-  // Sort by descending Y, then ascending X
   const sorted = [...items]
     .filter((i) => i.str.trim())
     .sort((a, b) => {
@@ -51,6 +58,27 @@ function itemsToLines(items: Array<{ str: string; transform: number[] }>): strin
   return lines;
 }
 
+/**
+ * Parse a Yardi Resident Ledger PDF.
+ *
+ * Each page has a known structure:
+ *   Page : NN Resident Ledger
+ *   Date: MM/DD/YY
+ *   Resident Code: t0005754
+ *   Property: margar
+ *   Unit: 14A
+ *   Rashad Hicks Status: Current
+ *   212 West 124th Street # 14A Current Rent: $788.00
+ *   New York, NY, 10027 Deposit: $788.00
+ *   Move In Date: 04/01/25
+ *   ...
+ *   Tel# (H): (347) 519-0143
+ *   Date Description Charges Payments Balance
+ *   Balance forward 0.00
+ *   ... transaction lines ...
+ *   Current 30 Days 60 Days 90 Days Amount Due
+ *   788.00 788.00 2554.80 0.00 4130.80
+ */
 export async function parseLedgerPDF(file: File): Promise<Map<string, LedgerData>> {
   const pdfjsLib = await import("pdfjs-dist");
   pdfjsLib.GlobalWorkerOptions.workerSrc = "/pdf.worker.min.mjs";
@@ -64,114 +92,186 @@ export async function parseLedgerPDF(file: File): Promise<Map<string, LedgerData
     const textContent = await page.getTextContent();
     const items = textContent.items as Array<{ str: string; transform: number[] }>;
     const lines = itemsToLines(items);
-    const fullText = lines.join("\n");
 
-    // ── Extract Unit ──
-    // Try explicit "Unit: 14H" or "Unit 14H" patterns first
     let unit = "";
-    const unitPatterns = [
-      /\bUnit\s*[:#]?\s*([A-Z0-9\-]+)/i,
-      /\bApt\.?\s*[:#]?\s*([A-Z0-9\-]+)/i,
-      /\bSuite\s*[:#]?\s*([A-Z0-9\-]+)/i,
-      // Yardi header often has unit inline: "14H Smith, John"
-      /^([A-Z0-9]{1,4}[A-Z0-9\-]*)\s+[A-Z][a-z]/m,
-    ];
-    for (const pat of unitPatterns) {
-      const m = fullText.match(pat);
-      if (m?.[1] && m[1].length <= 6) {
-        unit = m[1].trim();
-        break;
-      }
-    }
-    if (!unit) unit = `Page${pageNum}`;
-
-    // ── Extract Tenant Name ──
     let name = "";
-    const namePatterns = [
-      /(?:Tenant|Resident|Name)\s*[:#]?\s*([A-Za-z\s,'\-]+?)(?:\n|$)/i,
-      /^[A-Z0-9]{1,6}\s+([A-Z][a-zA-Z\-']+,\s*[A-Z][a-zA-Z\-'\s]+)$/m,
-    ];
-    for (const pat of namePatterns) {
-      const m = fullText.match(pat);
-      if (m?.[1]?.trim()) {
-        name = m[1].trim();
-        break;
+    let rent = 0;
+    let phone = "";
+    let residentCode = "";
+    const transactions: Transaction[] = [];
+    const aging = { current: 0, days30: 0, days60: 0, days90: 0, over90: 0 };
+    let amountDue = 0;
+
+    // Track parser state
+    let inTransactionSection = false;
+    let agingHeaderIdx = -1;
+
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+
+      // ── Unit: 14A ──
+      const unitMatch = line.match(/^\s*Unit\s*[:#]?\s*([A-Z0-9][A-Z0-9\-]*)\s*$/i);
+      if (unitMatch && !unit) {
+        unit = unitMatch[1].trim();
+        continue;
+      }
+
+      // ── Resident Code: t0005754 ──
+      const codeMatch = line.match(/Resident\s*Code\s*[:#]?\s*(t\d+)/i);
+      if (codeMatch) {
+        residentCode = codeMatch[1].toLowerCase();
+        continue;
+      }
+
+      // ── Name line: "Rashad Hicks Status: Current" or "Hicks, Rashad Status: Current" ──
+      const statusMatch = line.match(/^(.+?)\s+Status\s*:\s*(Current|Past|Evicted|Notice|Future)/i);
+      if (statusMatch && !name) {
+        const rawName = statusMatch[1].trim();
+        // Make sure it's not a header line or property line
+        if (rawName.length > 1 && !rawName.match(/^(Page|Date|Property|Unit|Resident)/i)) {
+          name = rawName;
+        }
+        continue;
+      }
+
+      // ── Current Rent: $788.00 ──
+      const rentMatch = line.match(/Current\s+Rent\s*[:#]?\s*\$?([\d,]+\.?\d*)/i);
+      if (rentMatch && !rent) {
+        rent = toAbsNum(rentMatch[1]);
+        // Don't continue — same line may have address info
+      }
+
+      // ── Tel# (H): (347) 519-0143 ──
+      const phoneMatch = line.match(/Tel#\s*\([HCM]\)\s*[:#]?\s*([\d\(\)\-\s]+)/i);
+      if (phoneMatch && !phone) {
+        phone = phoneMatch[1].trim();
+      }
+
+      // ── Transaction header row: "Date Description Charges Payments Balance" ──
+      if (/^\s*Date\s+Description\s+Charges\s+Payments\s+Balance/i.test(line)) {
+        inTransactionSection = true;
+        continue;
+      }
+
+      // ── Aging header row: "Current 30 Days 60 Days 90 Days Amount Due" ──
+      if (/Current\s+30\s*Days?\s+60\s*Days?\s+90\s*Days?\s+Amount\s*Due/i.test(line)) {
+        inTransactionSection = false;
+        agingHeaderIdx = i;
+        continue;
+      }
+
+      // ── Aging values row (immediately after aging header) ──
+      if (agingHeaderIdx >= 0 && i === agingHeaderIdx + 1) {
+        const nums = Array.from(line.matchAll(/-?[\d,]+\.?\d*/g))
+          .map((m) => m[0])
+          .filter((s) => s.trim());
+        if (nums.length >= 4) {
+          aging.current = toAbsNum(nums[0]);
+          aging.days30 = toAbsNum(nums[1]);
+          aging.days60 = toAbsNum(nums[2]);
+          aging.days90 = toAbsNum(nums[3]);
+          if (nums.length >= 5) {
+            amountDue = toAbsNum(nums[nums.length - 1]);
+          }
+        }
+        continue;
+      }
+
+      // ── Transaction lines (between header and aging) ──
+      if (inTransactionSection) {
+        // "Balance forward" line
+        const bfMatch = line.match(/Balance\s+forward\s+([\d,\-]+\.?\d*)/i);
+        if (bfMatch) {
+          // Skip or record as first transaction
+          continue;
+        }
+
+        // Transaction lines start with a date: MM/DD/YY or MM/DD/YYYY
+        const dateRe = /^(\d{1,2}\/\d{1,2}\/\d{2,4})/;
+        const dateMatch = line.match(dateRe);
+        if (!dateMatch) continue;
+
+        const date = dateMatch[1];
+        // Everything after the date up to the numbers is the description
+        const afterDate = line.slice(dateMatch[0].length).trim();
+
+        // Extract all monetary values from the line
+        const moneyMatches = Array.from(afterDate.matchAll(/([\d,]+\.?\d{0,2})(?=\s|$)/g));
+        if (moneyMatches.length < 1) continue;
+
+        const nums = moneyMatches.map((m) => toNum(m[1]));
+
+        // Extract description (text before the first number)
+        const firstNumIdx = afterDate.indexOf(moneyMatches[0][0]);
+        const desc = afterDate.slice(0, firstNumIdx).replace(/\s+/g, " ").trim();
+
+        // Yardi format: Description Charges Payments Balance
+        // Some lines have 3 numbers (charge, payment, balance)
+        // Some have 2 numbers (either charge+balance or payment+balance)
+        let charges = 0;
+        let payments = 0;
+        let balance = 0;
+
+        if (nums.length >= 3) {
+          charges = nums[nums.length - 3];
+          payments = nums[nums.length - 2];
+          balance = nums[nums.length - 1];
+        } else if (nums.length === 2) {
+          // Could be charges+balance or payments+balance
+          // Heuristic: if description contains payment-like words, second-to-last is payment
+          const isPayment = /payment|chk#|check|deposit|credit|debit|card/i.test(desc);
+          if (isPayment) {
+            payments = nums[0];
+          } else {
+            charges = nums[0];
+          }
+          balance = nums[1];
+        } else if (nums.length === 1) {
+          balance = nums[0];
+        }
+
+        transactions.push({
+          date,
+          description: desc || "Transaction",
+          charges,
+          payments,
+          balance,
+        });
       }
     }
 
-    // ── Extract Rent ──
-    let rent = 0;
-    const rentMatch = fullText.match(/(?:Monthly\s+)?Rent\s*[:#]?\s*\$?([\d,]+\.?\d*)/i);
-    if (rentMatch) rent = toNum(rentMatch[1]);
-
-    // ── Parse Transactions ──
-    const transactions: Transaction[] = [];
-    const dateRe = /\b(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})\b/;
-
-    for (const line of lines) {
-      if (!dateRe.test(line)) continue;
-      const dateMatch = line.match(dateRe);
-      if (!dateMatch) continue;
-
-      // Extract all numbers from the line
-      const numMatches = Array.from(line.matchAll(/-?\$?([\d,]+\.?\d{0,2})/g));
-      if (numMatches.length < 2) continue;
-
-      const nums = numMatches.map((m) => toNum(m[0]));
-
-      // Remove the date from the description
-      const desc = line
-        .replace(dateRe, "")
-        .replace(/-?\$?[\d,]+\.?\d*/g, "")
-        .replace(/\s+/g, " ")
-        .trim();
-
-      // Heuristic: last number is balance, second-to-last is either payment or charge
-      const balance = nums[nums.length - 1];
-      const payment = nums[nums.length - 2] || 0;
-      const charge = nums.length >= 3 ? nums[nums.length - 3] || 0 : 0;
-
-      transactions.push({
-        date: dateMatch[1],
-        description: desc || "Transaction",
-        charges: charge,
-        payments: payment,
-        balance,
-      });
-    }
-
-    // ── Extract Aging ──
-    const agingPatterns = {
-      current: [/Current\s*(?:Balance)?\s*[:#]?\s*\$?([\d,]+\.?\d*)/i],
-      days30: [/30\s*(?:Days?|Day)\s*[:#]?\s*\$?([\d,]+\.?\d*)/i, /0[-–]30\s*[:#]?\s*\$?([\d,]+\.?\d*)/i],
-      days60: [/60\s*(?:Days?|Day)\s*[:#]?\s*\$?([\d,]+\.?\d*)/i, /31[-–]60\s*[:#]?\s*\$?([\d,]+\.?\d*)/i],
-      days90: [/90\s*(?:Days?|Day)\s*[:#]?\s*\$?([\d,]+\.?\d*)/i, /61[-–]90\s*[:#]?\s*\$?([\d,]+\.?\d*)/i],
-      over90: [/(?:Over\s*90|90\+)\s*(?:Days?)?\s*[:#]?\s*\$?([\d,]+\.?\d*)/i, /(?:120|180)\s*(?:Days?)[:#]?\s*\$?([\d,]+\.?\d*)/i],
-    };
-
-    const aging = { current: 0, days30: 0, days60: 0, days90: 0, over90: 0 };
-    for (const [key, patterns] of Object.entries(agingPatterns)) {
-      for (const pat of patterns) {
-        const m = fullText.match(pat);
-        if (m?.[1]) {
-          (aging as Record<string, number>)[key] = toNum(m[1]);
+    // Fallback: if no aging header found, try to find aging from last lines
+    if (agingHeaderIdx < 0) {
+      // Look for "Amount Due" on any line
+      for (const line of lines) {
+        const adMatch = line.match(/Amount\s*Due\s*[:#]?\s*\$?([\d,]+\.?\d*)/i);
+        if (adMatch) {
+          amountDue = toAbsNum(adMatch[1]);
           break;
         }
       }
     }
 
-    // ── Extract Amount Due ──
-    let amountDue = 0;
-    const amountDueMatch = fullText.match(/Amount\s*Due\s*[:#]?\s*\$?([\d,]+\.?\d*)/i);
-    if (amountDueMatch) {
-      amountDue = toNum(amountDueMatch[1]);
-    } else {
+    // Compute amount due from aging if not found
+    if (!amountDue && (aging.current || aging.days30 || aging.days60 || aging.days90 || aging.over90)) {
       amountDue = aging.current + aging.days30 + aging.days60 + aging.days90 + aging.over90;
     }
 
-    // Normalize unit key for consistent lookup (uppercase, trimmed)
+    // If no unit found, use page number
+    if (!unit) unit = `Page${pageNum}`;
+
+    // Normalize unit key
     const unitKey = unit.toUpperCase().trim();
-    tenantMap.set(unitKey, { unit, name, rent, transactions, aging, amountDue });
+    tenantMap.set(unitKey, {
+      unit,
+      name,
+      rent,
+      phone,
+      residentCode,
+      transactions,
+      aging,
+      amountDue,
+    });
   }
 
   return tenantMap;

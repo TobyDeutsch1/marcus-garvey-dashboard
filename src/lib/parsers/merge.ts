@@ -6,8 +6,10 @@ interface LedgerEntry {
   unit: string;
   name: string;
   rent: number;
+  phone?: string;
+  residentCode?: string;
   transactions: { date: string; description: string; charges: number; payments: number; balance: number }[];
-  aging: { current: number; days30: number; days60: number; days90: number };
+  aging: { current: number; days30: number; days60: number; days90: number; over90?: number };
   amountDue: number;
 }
 
@@ -63,12 +65,12 @@ export function mergeTenantData(
     const { lastPaymentDate, lastPaymentAmount } = findLastPayment(transactions);
 
     const tenant: Tenant = {
-      id: ar.id || `tenant-${index}`,
+      id: ar.id || ledger?.residentCode || `tenant-${index}`,
       unit: ar.unit || ledger?.unit || roster?.unit || "",
       firstName: ar.firstName || "",
       lastName: ar.lastName || "",
       rent: ledger?.rent || roster?.rent || ar.rent || 0,
-      phone: roster?.phone || "",
+      phone: roster?.phone || ledger?.phone || "",
       email: roster?.email || "",
       balance: ar.balance || ledger?.amountDue || 0,
       current: ar.current || ledger?.aging.current || 0,
@@ -118,19 +120,19 @@ export function mergeTenantData(
     const balance = ledger.amountDue || (ledger.aging.current + ledger.aging.days30 + ledger.aging.days60 + ledger.aging.days90);
 
     const tenant: Tenant = {
-      id: `ledger-${ledgerIdx++}`,
+      id: ledger.residentCode || `ledger-${ledgerIdx++}`,
       unit: ledger.unit,
       firstName,
       lastName,
       rent: ledger.rent || roster?.rent || 0,
-      phone: roster?.phone || "",
+      phone: roster?.phone || ledger.phone || "",
       email: roster?.email || "",
       balance,
       current: ledger.aging.current,
       days30: ledger.aging.days30,
       days60: ledger.aging.days60,
       days90: ledger.aging.days90,
-      over90: 0,
+      over90: ledger.aging.over90 || 0,
       transactions: ledger.transactions,
       lastPaymentDate,
       lastPaymentAmount,
