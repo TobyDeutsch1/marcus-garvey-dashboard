@@ -10,124 +10,168 @@ interface LedgerData {
     days30: number;
     days60: number;
     days90: number;
+    over90: number;
   };
   amountDue: number;
 }
 
+function toNum(s: string): number {
+  const n = parseFloat(s.replace(/[$,\s()]/g, "").trim());
+  return isNaN(n) ? 0 : Math.abs(n);
+}
+
+/** Group PDF text items into lines sorted top-to-bottom, left-to-right */
+function itemsToLines(items: Array<{ str: string; transform: number[] }>): string[] {
+  if (!items.length) return [];
+
+  // Sort by descending Y, then ascending X
+  const sorted = [...items]
+    .filter((i) => i.str.trim())
+    .sort((a, b) => {
+      const dy = b.transform[5] - a.transform[5];
+      if (Math.abs(dy) > 3) return dy;
+      return a.transform[4] - b.transform[4];
+    });
+
+  const lines: string[] = [];
+  let curLine = sorted[0].str;
+  let lastY = sorted[0].transform[5];
+
+  for (let i = 1; i < sorted.length; i++) {
+    const y = sorted[i].transform[5];
+    if (Math.abs(y - lastY) > 5) {
+      lines.push(curLine.trim());
+      curLine = sorted[i].str;
+      lastY = y;
+    } else {
+      curLine += " " + sorted[i].str;
+    }
+  }
+  if (curLine.trim()) lines.push(curLine.trim());
+  return lines;
+}
+
 export async function parseLedgerPDF(file: File): Promise<Map<string, LedgerData>> {
   const pdfjsLib = await import("pdfjs-dist");
-
-  // Use the worker file copied to public/ for reliable loading
   pdfjsLib.GlobalWorkerOptions.workerSrc = "/pdf.worker.min.mjs";
 
   const arrayBuffer = await file.arrayBuffer();
   const pdf = await pdfjsLib.getDocument({ data: new Uint8Array(arrayBuffer) }).promise;
   const tenantMap = new Map<string, LedgerData>();
 
-  for (let i = 1; i <= pdf.numPages; i++) {
-    const page = await pdf.getPage(i);
+  for (let pageNum = 1; pageNum <= pdf.numPages; pageNum++) {
+    const page = await pdf.getPage(pageNum);
     const textContent = await page.getTextContent();
     const items = textContent.items as Array<{ str: string; transform: number[] }>;
-
-    // Sort by Y position (descending) then X position
-    const sorted = items
-      .filter((item) => item.str.trim())
-      .sort((a, b) => {
-        const yDiff = b.transform[5] - a.transform[5];
-        if (Math.abs(yDiff) > 2) return yDiff;
-        return a.transform[4] - b.transform[4];
-      });
-
-    const lines: string[] = [];
-    let currentLine = "";
-    let lastY = sorted[0]?.transform[5] ?? 0;
-
-    for (const item of sorted) {
-      const y = item.transform[5];
-      if (Math.abs(y - lastY) > 5) {
-        if (currentLine.trim()) lines.push(currentLine.trim());
-        currentLine = item.str;
-        lastY = y;
-      } else {
-        currentLine += "  " + item.str;
-      }
-    }
-    if (currentLine.trim()) lines.push(currentLine.trim());
-
+    const lines = itemsToLines(items);
     const fullText = lines.join("\n");
 
-    // Extract unit
-    const unitMatch = fullText.match(/Unit[:\s]+(\w+)/i);
-    const unit = unitMatch?.[1] || `Page${i}`;
+    // ── Extract Unit ──
+    // Try explicit "Unit: 14H" or "Unit 14H" patterns first
+    let unit = "";
+    const unitPatterns = [
+      /\bUnit\s*[:#]?\s*([A-Z0-9\-]+)/i,
+      /\bApt\.?\s*[:#]?\s*([A-Z0-9\-]+)/i,
+      /\bSuite\s*[:#]?\s*([A-Z0-9\-]+)/i,
+      // Yardi header often has unit inline: "14H Smith, John"
+      /^([A-Z0-9]{1,4}[A-Z0-9\-]*)\s+[A-Z][a-z]/m,
+    ];
+    for (const pat of unitPatterns) {
+      const m = fullText.match(pat);
+      if (m?.[1] && m[1].length <= 6) {
+        unit = m[1].trim();
+        break;
+      }
+    }
+    if (!unit) unit = `Page${pageNum}`;
 
-    // Extract name
-    const nameMatch = fullText.match(/(?:Tenant|Resident|Name)[:\s]+([A-Za-z\s,'-]+)/i);
-    const name = nameMatch?.[1]?.trim() || "";
+    // ── Extract Tenant Name ──
+    let name = "";
+    const namePatterns = [
+      /(?:Tenant|Resident|Name)\s*[:#]?\s*([A-Za-z\s,'\-]+?)(?:\n|$)/i,
+      /^[A-Z0-9]{1,6}\s+([A-Z][a-zA-Z\-']+,\s*[A-Z][a-zA-Z\-'\s]+)$/m,
+    ];
+    for (const pat of namePatterns) {
+      const m = fullText.match(pat);
+      if (m?.[1]?.trim()) {
+        name = m[1].trim();
+        break;
+      }
+    }
 
-    // Extract rent
-    const rentMatch = fullText.match(/(?:Rent|Monthly)[:\s]*\$?([\d,]+\.?\d*)/i);
-    const rent = rentMatch ? parseFloat(rentMatch[1].replace(/,/g, "")) : 0;
+    // ── Extract Rent ──
+    let rent = 0;
+    const rentMatch = fullText.match(/(?:Monthly\s+)?Rent\s*[:#]?\s*\$?([\d,]+\.?\d*)/i);
+    if (rentMatch) rent = toNum(rentMatch[1]);
 
-    // Parse transactions
+    // ── Parse Transactions ──
     const transactions: Transaction[] = [];
-    const txnRegex =
-      /(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})\s+(.+?)\s+([\d,]+\.?\d*)\s+([\d,]+\.?\d*)\s+([\d,]+\.?\d*)/g;
-    let match;
+    const dateRe = /\b(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})\b/;
 
-    while ((match = txnRegex.exec(fullText)) !== null) {
+    for (const line of lines) {
+      if (!dateRe.test(line)) continue;
+      const dateMatch = line.match(dateRe);
+      if (!dateMatch) continue;
+
+      // Extract all numbers from the line
+      const numMatches = Array.from(line.matchAll(/-?\$?([\d,]+\.?\d{0,2})/g));
+      if (numMatches.length < 2) continue;
+
+      const nums = numMatches.map((m) => toNum(m[0]));
+
+      // Remove the date from the description
+      const desc = line
+        .replace(dateRe, "")
+        .replace(/-?\$?[\d,]+\.?\d*/g, "")
+        .replace(/\s+/g, " ")
+        .trim();
+
+      // Heuristic: last number is balance, second-to-last is either payment or charge
+      const balance = nums[nums.length - 1];
+      const payment = nums[nums.length - 2] || 0;
+      const charge = nums.length >= 3 ? nums[nums.length - 3] || 0 : 0;
+
       transactions.push({
-        date: match[1],
-        description: match[2].trim(),
-        charges: parseFloat(match[3].replace(/,/g, "")) || 0,
-        payments: parseFloat(match[4].replace(/,/g, "")) || 0,
-        balance: parseFloat(match[5].replace(/,/g, "")) || 0,
+        date: dateMatch[1],
+        description: desc || "Transaction",
+        charges: charge,
+        payments: payment,
+        balance,
       });
     }
 
-    // Also try simpler date-based line matching
-    if (transactions.length === 0) {
-      for (const line of lines) {
-        const simpleMatch = line.match(
-          /(\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4})\s+(.+)/
-        );
-        if (simpleMatch) {
-          const nums = simpleMatch[2].match(/-?[\d,]+\.?\d*/g);
-          if (nums && nums.length >= 2) {
-            const values = nums.map((n) => parseFloat(n.replace(/,/g, "")) || 0);
-            transactions.push({
-              date: simpleMatch[1],
-              description: simpleMatch[2]
-                .replace(/-?[\d,]+\.?\d*/g, "")
-                .trim(),
-              charges: values[0] || 0,
-              payments: values[1] || 0,
-              balance: values[values.length - 1] || 0,
-            });
-          }
+    // ── Extract Aging ──
+    const agingPatterns = {
+      current: [/Current\s*(?:Balance)?\s*[:#]?\s*\$?([\d,]+\.?\d*)/i],
+      days30: [/30\s*(?:Days?|Day)\s*[:#]?\s*\$?([\d,]+\.?\d*)/i, /0[-–]30\s*[:#]?\s*\$?([\d,]+\.?\d*)/i],
+      days60: [/60\s*(?:Days?|Day)\s*[:#]?\s*\$?([\d,]+\.?\d*)/i, /31[-–]60\s*[:#]?\s*\$?([\d,]+\.?\d*)/i],
+      days90: [/90\s*(?:Days?|Day)\s*[:#]?\s*\$?([\d,]+\.?\d*)/i, /61[-–]90\s*[:#]?\s*\$?([\d,]+\.?\d*)/i],
+      over90: [/(?:Over\s*90|90\+)\s*(?:Days?)?\s*[:#]?\s*\$?([\d,]+\.?\d*)/i, /(?:120|180)\s*(?:Days?)[:#]?\s*\$?([\d,]+\.?\d*)/i],
+    };
+
+    const aging = { current: 0, days30: 0, days60: 0, days90: 0, over90: 0 };
+    for (const [key, patterns] of Object.entries(agingPatterns)) {
+      for (const pat of patterns) {
+        const m = fullText.match(pat);
+        if (m?.[1]) {
+          (aging as Record<string, number>)[key] = toNum(m[1]);
+          break;
         }
       }
     }
 
-    // Extract aging
-    const currentMatch = fullText.match(/Current[:\s]*\$?([\d,]+\.?\d*)/i);
-    const days30Match = fullText.match(/30\s*(?:Days?|day)[:\s]*\$?([\d,]+\.?\d*)/i);
-    const days60Match = fullText.match(/60\s*(?:Days?|day)[:\s]*\$?([\d,]+\.?\d*)/i);
-    const days90Match = fullText.match(/90\s*(?:Days?|day)[:\s]*\$?([\d,]+\.?\d*)/i);
-    const amountDueMatch = fullText.match(/Amount\s*Due[:\s]*\$?([\d,]+\.?\d*)/i);
+    // ── Extract Amount Due ──
+    let amountDue = 0;
+    const amountDueMatch = fullText.match(/Amount\s*Due\s*[:#]?\s*\$?([\d,]+\.?\d*)/i);
+    if (amountDueMatch) {
+      amountDue = toNum(amountDueMatch[1]);
+    } else {
+      amountDue = aging.current + aging.days30 + aging.days60 + aging.days90 + aging.over90;
+    }
 
-    tenantMap.set(unit, {
-      unit,
-      name,
-      rent,
-      transactions,
-      aging: {
-        current: currentMatch ? parseFloat(currentMatch[1].replace(/,/g, "")) : 0,
-        days30: days30Match ? parseFloat(days30Match[1].replace(/,/g, "")) : 0,
-        days60: days60Match ? parseFloat(days60Match[1].replace(/,/g, "")) : 0,
-        days90: days90Match ? parseFloat(days90Match[1].replace(/,/g, "")) : 0,
-      },
-      amountDue: amountDueMatch ? parseFloat(amountDueMatch[1].replace(/,/g, "")) : 0,
-    });
+    // Normalize unit key for consistent lookup (uppercase, trimmed)
+    const unitKey = unit.toUpperCase().trim();
+    tenantMap.set(unitKey, { unit, name, rent, transactions, aging, amountDue });
   }
 
   return tenantMap;

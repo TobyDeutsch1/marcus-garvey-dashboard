@@ -131,7 +131,9 @@ export function LegalReview() {
                   <span className="text-muted-foreground">Avg Balance</span>
                   <div className="text-lg font-bold">
                     {formatCurrency(
-                      flagged.reduce((s, t) => s + t.balance, 0) / flagged.length
+                      flagged.length > 0
+                        ? flagged.reduce((s, t) => s + t.balance, 0) / flagged.length
+                        : 0
                     )}
                   </div>
                 </div>

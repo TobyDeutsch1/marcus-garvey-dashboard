@@ -46,7 +46,7 @@ export function mergeTenantData(
 ): Tenant[] {
   const rosterMap = new Map<string, RosterEntry>();
   for (const entry of rosterData) {
-    rosterMap.set(entry.unit.toUpperCase(), entry);
+    rosterMap.set(entry.unit.toUpperCase().trim(), entry);
   }
 
   // Track which ledger/roster units we've already handled via AR data

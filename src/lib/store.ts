@@ -2,6 +2,7 @@
 
 import { create } from "zustand";
 import { Tenant, RiskTier, SortField, SortDirection, ComparisonData } from "./types";
+import { getRiskTier } from "./utils";
 
 interface DashboardState {
   tenants: Tenant[];
@@ -58,15 +59,12 @@ export const useDashboardStore = create<DashboardState>((set) => ({
     set((state) => ({ expandedTenantId: state.expandedTenantId === id ? null : id })),
   toggleLegalFlag: (tenantId) =>
     set((state) => ({
-      tenants: state.tenants.map((t) =>
-        t.id === tenantId
-          ? {
-              ...t,
-              flaggedForLegal: !t.flaggedForLegal,
-              riskTier: !t.flaggedForLegal ? "legal-review" : t.over90 > 0 ? "at-risk" : t.days60 > 0 || t.days90 > 0 ? "watch" : "current",
-            }
-          : t
-      ),
+      tenants: state.tenants.map((t) => {
+        if (t.id !== tenantId) return t;
+        const updated = { ...t, flaggedForLegal: !t.flaggedForLegal };
+        updated.riskTier = getRiskTier(updated);
+        return updated;
+      }),
     })),
   togglePaymentPlan: (tenantId) =>
     set((state) => ({

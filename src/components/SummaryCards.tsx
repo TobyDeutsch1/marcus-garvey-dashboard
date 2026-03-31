@@ -1,5 +1,6 @@
 "use client";
 
+import { useMemo } from "react";
 import { DollarSign, Users, TrendingUp, Clock } from "lucide-react";
 import { Card, CardContent, CardHeader, CardTitle } from "./ui/card";
 import { useDashboardStore } from "@/lib/store";
@@ -8,49 +9,62 @@ import { formatCurrency, estimateAvgDaysDelinquent } from "@/lib/utils";
 export function SummaryCards() {
   const tenants = useDashboardStore((s) => s.tenants);
 
-  const totalAR = tenants.reduce((sum, t) => sum + t.balance, 0);
-  const tenantsWithBalances = tenants.filter((t) => t.balance > 0).length;
-  const collectedThisMonth = tenants.reduce((sum, t) => {
-    for (const txn of t.transactions) {
-      try {
-        const d = new Date(txn.date);
-        const now = new Date();
-        if (d.getMonth() === now.getMonth() && d.getFullYear() === now.getFullYear()) {
-          return sum + txn.payments;
+  const stats = useMemo(() => {
+    const now = new Date();
+    const thisMonth = now.getMonth();
+    const thisYear = now.getFullYear();
+
+    const totalAR = tenants.reduce((sum, t) => sum + t.balance, 0);
+    const tenantsWithBalances = tenants.filter((t) => t.balance > 0).length;
+    const avgDays = estimateAvgDaysDelinquent(tenants);
+
+    let collectedThisMonth = 0;
+    for (const t of tenants) {
+      for (const txn of t.transactions) {
+        if (txn.payments <= 0) continue;
+        try {
+          const d = new Date(txn.date);
+          if (!isNaN(d.getTime()) && d.getMonth() === thisMonth && d.getFullYear() === thisYear) {
+            collectedThisMonth += txn.payments;
+          }
+        } catch {
+          // skip unparseable dates
         }
-      } catch {
-        // skip unparseable dates
       }
     }
-    return sum;
-  }, 0);
-  const avgDays = estimateAvgDaysDelinquent(tenants);
+
+    return { totalAR, tenantsWithBalances, collectedThisMonth, avgDays };
+  }, [tenants]);
 
   const cards = [
     {
       title: "Total AR",
-      value: formatCurrency(totalAR),
+      value: formatCurrency(stats.totalAR),
+      sub: `${stats.tenantsWithBalances} tenants carrying balances`,
       icon: DollarSign,
       color: "text-red-600",
       bg: "bg-red-50",
     },
     {
       title: "Tenants with Balances",
-      value: `${tenantsWithBalances} / ${tenants.length}`,
+      value: `${stats.tenantsWithBalances} / ${tenants.length}`,
+      sub: `${tenants.length - stats.tenantsWithBalances} current`,
       icon: Users,
       color: "text-orange-600",
       bg: "bg-orange-50",
     },
     {
       title: "Collected This Month",
-      value: formatCurrency(collectedThisMonth),
+      value: formatCurrency(stats.collectedThisMonth),
+      sub: "From transaction history",
       icon: TrendingUp,
       color: "text-green-600",
       bg: "bg-green-50",
     },
     {
       title: "Avg Days Delinquent",
-      value: `${avgDays} days`,
+      value: `${stats.avgDays} days`,
+      sub: "Estimated from aging buckets",
       icon: Clock,
       color: "text-blue-600",
       bg: "bg-blue-50",
@@ -69,6 +83,7 @@ export function SummaryCards() {
           </CardHeader>
           <CardContent>
             <div className="text-2xl font-bold">{card.value}</div>
+            <p className="text-xs text-muted-foreground mt-1">{card.sub}</p>
           </CardContent>
         </Card>
       ))}
