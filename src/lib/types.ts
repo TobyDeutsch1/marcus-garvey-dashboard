@@ -56,6 +56,12 @@ export interface ComparisonData {
   currentOver90: number;
 }
 
+export interface Property {
+  code: string;
+  name: string;
+  tenants: Tenant[];
+}
+
 export type SortField =
   | "unit"
   | "name"

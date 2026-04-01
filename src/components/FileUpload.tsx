@@ -8,9 +8,10 @@ import { parseLedgerPDF } from "@/lib/parsers/ledger-parser";
 import { parseRoster } from "@/lib/parsers/roster-parser";
 import { mergeTenantData } from "@/lib/parsers/merge";
 import { useDashboardStore } from "@/lib/store";
+import { propertyDisplayName } from "@/lib/property-names";
 
 export function FileUpload() {
-  const { setTenants, setIsLoading } = useDashboardStore();
+  const { addProperty, setIsLoading } = useDashboardStore();
   const [arFile, setArFile] = useState<File | null>(null);
   const [ledgerFile, setLedgerFile] = useState<File | null>(null);
   const [rosterFile, setRosterFile] = useState<File | null>(null);
@@ -25,19 +26,40 @@ export function FileUpload() {
     setStatus({ type: "info", text: "Parsing files…" });
 
     try {
-      const [arData, ledgerData, rosterData] = await Promise.all([
+      const [arData, ledgerResult, rosterData] = await Promise.all([
         arFile ? parseARReport(arFile) : Promise.resolve([]),
-        ledgerFile ? parseLedgerPDF(ledgerFile) : Promise.resolve(new Map()),
+        ledgerFile
+          ? parseLedgerPDF(ledgerFile)
+          : Promise.resolve({ tenants: new Map(), propertyCode: "" }),
         rosterFile ? parseRoster(rosterFile) : Promise.resolve([]),
       ]);
 
+      const ledgerData = ledgerResult.tenants;
+      const propertyCode = ledgerResult.propertyCode;
       const tenants = mergeTenantData(arData, ledgerData, rosterData);
 
       if (tenants.length === 0) {
-        setStatus({ type: "error", text: "No tenants found. Check that your files match the expected Yardi format." });
+        setStatus({
+          type: "error",
+          text: "No tenants found. Check that your files match the expected format.",
+        });
       } else {
-        setTenants(tenants);
-        setStatus({ type: "success", text: `Loaded ${tenants.length} tenants successfully.` });
+        // Determine property name
+        const code = propertyCode || "default";
+        const displayName = propertyDisplayName(code);
+
+        // Add as a property tab
+        addProperty(code, displayName, tenants);
+
+        setStatus({
+          type: "success",
+          text: `Loaded ${tenants.length} tenants for ${displayName}.`,
+        });
+
+        // Clear files for next upload
+        setArFile(null);
+        setLedgerFile(null);
+        setRosterFile(null);
       }
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
@@ -46,7 +68,7 @@ export function FileUpload() {
     } finally {
       setIsLoading(false);
     }
-  }, [arFile, ledgerFile, rosterFile, hasAnyFile, setTenants, setIsLoading]);
+  }, [arFile, ledgerFile, rosterFile, hasAnyFile, addProperty, setIsLoading]);
 
   return (
     <div className="space-y-4">
@@ -132,7 +154,10 @@ function FileDropZone({
             ? "border-green-400 bg-green-50"
             : "border-gray-300 hover:border-gray-400 hover:bg-gray-50"
         }`}
-        onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
+        onDragOver={(e) => {
+          e.preventDefault();
+          setDragOver(true);
+        }}
         onDragLeave={() => setDragOver(false)}
         onDrop={(e) => {
           e.preventDefault();
@@ -148,7 +173,6 @@ function FileDropZone({
           onChange={(e) => {
             const f = e.target.files?.[0];
             if (f) onFile(f);
-            // Reset input so same file can be re-selected
             e.target.value = "";
           }}
         />
@@ -170,7 +194,10 @@ function FileDropZone({
       </label>
       {file && (
         <button
-          onClick={(e) => { e.stopPropagation(); onClear(); }}
+          onClick={(e) => {
+            e.stopPropagation();
+            onClear();
+          }}
           className="absolute top-2 right-2 p-1 rounded-full bg-white border hover:bg-red-50 hover:border-red-300 transition-colors"
           title="Remove file"
         >

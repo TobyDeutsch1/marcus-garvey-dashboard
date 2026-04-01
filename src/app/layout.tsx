@@ -14,8 +14,8 @@ const geistMono = localFont({
 });
 
 export const metadata: Metadata = {
-  title: "Marcus Garvey AR Dashboard",
-  description: "Tenant Accounts Receivable Dashboard",
+  title: "Yardi AR Dashboard",
+  description: "Multi-Property Tenant Accounts Receivable Dashboard",
 };
 
 export default function RootLayout({
